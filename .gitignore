@@ -2,3 +2,7 @@ node_modules
 FLUTTER_IMPLEMENTATION_PRD.md
 CALL_AND_CHAT_PRD.md
 package-lock.json
+
+.env
+
+GENDER_MATCHMAKING_REDIS_PRD.md

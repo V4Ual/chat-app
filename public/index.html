@@ -297,10 +297,15 @@
 
   // --- MATCHMAKING ---
   function startSearch() {
+    let userId = localStorage.getItem('chat_user_id');
+    if (!userId) {
+      userId = 'usr_' + Math.random().toString(36).substring(2, 9);
+      localStorage.setItem('chat_user_id', userId);
+    }
     const gender = document.getElementById('myGender').value;
     const targetGender = document.getElementById('targetGender').value;
     showScreen('screenWaiting');
-    socket.emit('match:find', { gender, targetGender });
+    socket.emit('match:find', { userId, gender, targetGender });
   }
 
   function cancelSearch() {
@@ -317,6 +322,10 @@
 
   socket.on('match:waiting', (data) => {
     document.getElementById('waitingStatus').innerText = data.message;
+  });
+
+  socket.on('match:limit_reached', (data) => {
+    alert(data.message);
   });
 
   socket.on('match:found', (data) => {
