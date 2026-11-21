@@ -34,11 +34,49 @@ const redis = new Redis(rawRedisUrl, {
 
 redis.on('connect', () => {
   console.log('✅ Connected to Redis successfully!');
+  // Clean stale users and sockets from previous sessions
+  redis.del('online:users', 'online:sockets').catch(() => { });
 });
 
 redis.on('error', (err) => {
   console.error('❌ Redis Connection Error:', err.message);
 });
+
+// --- REAL-TIME UNIQUE ONLINE USERS TRACKING (Deduplicated by userId) ---
+// Map of userId -> Set of active socket IDs
+const onlineUserSockets = new Map();
+
+async function getOnlineUsersCount() {
+  const baseOffset = parseInt(process.env.ONLINE_BASE_COUNT || '0', 10);
+  let uniqueUsers = onlineUserSockets.size;
+  try {
+    if (redis.status === 'ready' || redis.status === 'connect') {
+      const redisUsers = await redis.scard('online:users');
+      if (redisUsers > 0) {
+        uniqueUsers = Math.max(uniqueUsers, redisUsers);
+      }
+    }
+  } catch (err) {
+    // Fall back to in-memory unique user count
+  }
+  return Math.max(1, uniqueUsers + baseOffset);
+}
+
+let broadcastTimer = null;
+function broadcastOnlineUsers() {
+  if (broadcastTimer) return;
+  broadcastTimer = setTimeout(async () => {
+    broadcastTimer = null;
+    try {
+      const count = await getOnlineUsersCount();
+      io.emit('online:count', { count, total: count });
+      io.emit('users:online', { count, total: count });
+      console.log(`[OnlineUsers] Real-time unique online count: ${count}`);
+    } catch (e) {
+      console.error('[OnlineUsers] Broadcast error:', e.message);
+    }
+  }, 100);
+}
 
 // --- DATE & TTL HELPERS ---
 function getTodayUTC() {
@@ -56,6 +94,10 @@ function getSecondsUntilMidnightUTC() {
 const activeMatches = new Map();
 const socketToMatchMap = new Map();
 
+// Disconnect grace period (prevents emitting disconnect or dropping active sessions on page refresh)
+const pendingDisconnects = new Map();
+const DISCONNECT_GRACE_PERIOD_MS = 3500;
+
 // --- REDIS QUEUE HELPERS ---
 async function removeFromAllRedisQueues(socketId) {
   try {
@@ -69,7 +111,7 @@ async function removeFromAllRedisQueues(socketId) {
           if (parsed.socketId === socketId) {
             await redis.lrem(queueKey, 0, item);
           }
-        } catch (e) {}
+        } catch (e) { }
       }
     }
   } catch (err) {
@@ -95,7 +137,7 @@ async function findMatchInRedis(currentUser) {
 
   // If user specifically requested cross-gender, but already used today's 1 quota
   if ((isMale && targetGender === 'female' && hasUsedDailyQuota) ||
-      (isFemale && targetGender === 'male' && hasUsedDailyQuota)) {
+    (isFemale && targetGender === 'male' && hasUsedDailyQuota)) {
     return { quotaExceeded: true, resetsInSeconds: ttl };
   }
 
@@ -202,16 +244,32 @@ async function findMatchInRedis(currentUser) {
   return { matched: false };
 }
 
-// --- REST API DIAGNOSTICS ---
+// --- REST API DIAGNOSTICS & METRICS ---
+app.get('/api/online-count', async (req, res) => {
+  try {
+    const count = await getOnlineUsersCount();
+    res.json({
+      success: true,
+      count,
+      total: count,
+      rawClientsCount: io.engine.clientsCount
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const maleCount = await redis.llen('queue:male');
     const femaleCount = await redis.llen('queue:female');
     const otherCount = await redis.llen('queue:other');
+    const onlineCount = await getOnlineUsersCount();
 
     res.json({
       status: 'healthy',
       redis: redis.status,
+      onlineUsers: onlineCount,
       waitingQueue: {
         male: maleCount,
         female: femaleCount,
@@ -231,7 +289,9 @@ app.get('/api/queue/stats', async (req, res) => {
     const male = await redis.llen('queue:male');
     const female = await redis.llen('queue:female');
     const other = await redis.llen('queue:other');
+    const onlineCount = await getOnlineUsersCount();
     res.json({
+      onlineUsers: onlineCount,
       waitingUsers: { male, female, other },
       totalWaiting: male + female + other,
       activeRooms: activeMatches.size
@@ -242,8 +302,77 @@ app.get('/api/queue/stats', async (req, res) => {
 });
 
 // --- SOCKET.IO EVENT HANDLERS ---
-io.on('connection', (socket) => {
-  console.log(`[Socket] Connected: ${socket.id}`);
+io.on('connection', async (socket) => {
+  const userId = socket.handshake.auth?.userId || socket.handshake.query?.userId || socket.id;
+  socket.userId = userId;
+  console.log(`[Socket] Connected: ${socket.id} (user: ${userId})`);
+
+  // Check if this user reconnected during the page refresh grace period
+  if (pendingDisconnects.has(userId)) {
+    const pending = pendingDisconnects.get(userId);
+    clearTimeout(pending.timer);
+    pendingDisconnects.delete(userId);
+    console.log(`[Reconnection] User ${userId} refreshed/reconnected! Cancelled disconnect emit.`);
+
+    // Clean up old socket from tracking
+    if (onlineUserSockets.has(userId)) {
+      onlineUserSockets.get(userId).delete(pending.socketId);
+    }
+    try {
+      await redis.srem('online:sockets', pending.socketId);
+    } catch (e) { }
+
+    // If user was in an active match when refreshing, seamlessly restore it
+    if (pending.matchId) {
+      const match = activeMatches.get(pending.matchId);
+      if (match) {
+        if (match.user1.userId === userId) {
+          match.user1.socketId = socket.id;
+        } else if (match.user2.userId === userId) {
+          match.user2.socketId = socket.id;
+        }
+        socketToMatchMap.delete(pending.socketId);
+        socketToMatchMap.set(socket.id, pending.matchId);
+        socket.join(pending.matchId);
+
+        const partner = (match.user1.userId === userId) ? match.user2 : match.user1;
+        socket.emit('match:found', {
+          matchId: pending.matchId,
+          peer: { name: partner.name, gender: partner.gender },
+          reconnected: true
+        });
+        socket.to(pending.matchId).emit('match:peer_reconnected', { matchId: pending.matchId });
+      }
+    }
+  }
+
+  // Track unique user in memory (userId -> Set of socket IDs)
+  if (!onlineUserSockets.has(userId)) {
+    onlineUserSockets.set(userId, new Set());
+  }
+  onlineUserSockets.get(userId).add(socket.id);
+
+  // Track in Redis unique user set
+  try {
+    await redis.sadd('online:users', userId);
+    await redis.sadd('online:sockets', socket.id);
+  } catch (e) { }
+
+  // Broadcast real-time online count to all clients
+  broadcastOnlineUsers();
+
+  // Send current online count immediately to newly connected client
+  getOnlineUsersCount().then((count) => {
+    socket.emit('online:count', { count, total: count });
+    socket.emit('users:online', { count, total: count });
+  }).catch(() => { });
+
+  // Direct pull request for online users count
+  socket.on('online:get', async () => {
+    const count = await getOnlineUsersCount();
+    socket.emit('online:count', { count, total: count });
+    socket.emit('users:online', { count, total: count });
+  });
 
   // 1. Enter Matchmaking Queue
   socket.on('match:find', async (data = {}) => {
@@ -428,17 +557,60 @@ io.on('connection', (socket) => {
     socket.to(matchId).emit('webrtc:ice-candidate', { candidate });
   });
 
-  // 5. Leave / Next / Skip Match
+  // 5. Leave / Next / Skip Match (User explicitly chose to leave)
   socket.on('match:leave', async () => {
+    if (socket.userId && pendingDisconnects.has(socket.userId)) {
+      clearTimeout(pendingDisconnects.get(socket.userId).timer);
+      pendingDisconnects.delete(socket.userId);
+    }
     await removeFromAllRedisQueues(socket.id);
     await leaveCurrentMatch(socket);
   });
 
-  // 6. Disconnect
-  socket.on('disconnect', async () => {
-    console.log(`[Socket] Disconnected: ${socket.id}`);
-    await removeFromAllRedisQueues(socket.id);
-    await leaveCurrentMatch(socket);
+  // 6. Disconnect (With Page-Refresh Grace Period)
+  socket.on('disconnect', async (reason) => {
+    console.log(`[Socket] Disconnected: ${socket.id} (user: ${socket.userId}, reason: ${reason})`);
+
+    const userId = socket.userId;
+    const matchId = socketToMatchMap.get(socket.id);
+
+    // Cancel any prior timer for this userId
+    if (userId && pendingDisconnects.has(userId)) {
+      clearTimeout(pendingDisconnects.get(userId).timer);
+    }
+
+    // Set grace period timer: wait 3.5s before emitting disconnect & tearing down match
+    const timer = setTimeout(async () => {
+      pendingDisconnects.delete(userId);
+      console.log(`[Socket] Grace period ended for ${userId}. Performing full cleanup.`);
+
+      if (userId && onlineUserSockets.has(userId)) {
+        onlineUserSockets.get(userId).delete(socket.id);
+        if (onlineUserSockets.get(userId).size === 0) {
+          onlineUserSockets.delete(userId);
+          try {
+            await redis.srem('online:users', userId);
+          } catch (e) { }
+        }
+      }
+
+      try {
+        await redis.srem('online:sockets', socket.id);
+      } catch (e) { }
+
+      await removeFromAllRedisQueues(socket.id);
+      await leaveCurrentMatch(socket);
+      broadcastOnlineUsers();
+    }, DISCONNECT_GRACE_PERIOD_MS);
+
+    if (userId) {
+      pendingDisconnects.set(userId, {
+        timer,
+        socketId: socket.id,
+        matchId,
+        disconnectedAt: Date.now()
+      });
+    }
   });
 
   async function leaveCurrentMatch(sock) {
@@ -457,7 +629,7 @@ io.on('connection', (socket) => {
           try {
             await redis.decr(`limit:mf:${partner.userId}:${today}`);
             console.log(`[Quota] Early disconnect (<30s). Refunded daily quota for partner: ${partner.userId}`);
-          } catch (e) {}
+          } catch (e) { }
         }
       }
 
@@ -468,7 +640,7 @@ io.on('connection', (socket) => {
       socketToMatchMap.delete(match.user1.socketId);
       socketToMatchMap.delete(match.user2.socketId);
       activeMatches.delete(matchId);
-      await redis.del(`match:${matchId}`).catch(() => {});
+      await redis.del(`match:${matchId}`).catch(() => { });
       sock.leave(matchId);
     }
   }
