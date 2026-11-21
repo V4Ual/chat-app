@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gender-Based Match, Ephemeral Chat & Calling</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 12px; }
+    .container { width: 100%; max-width: 480px; height: 92vh; background: #1e293b; border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; position: relative; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
+    
+    /* Screen management */
+    .screen { display: none; flex-direction: column; height: 100%; }
+    .screen.active { display: flex; }
+
+    /* Lobby */
+    .lobby { padding: 24px; justify-content: center; text-align: center; gap: 16px; overflow-y: auto; }
+    .lobby h1 { font-size: 24px; color: #38bdf8; }
+    .form-group { text-align: left; }
+    .form-group label { display: block; font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
+    select, input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; font-size: 15px; }
+    .btn { background: #2563eb; color: #fff; padding: 12px 18px; border-radius: 8px; border: none; font-size: 15px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+    .btn:hover { background: #1d4ed8; }
+    .btn-secondary { background: #334155; color: #e2e8f0; }
+    .btn-secondary:hover { background: #475569; }
+    .btn-danger { background: #ef4444; }
+    .btn-danger:hover { background: #dc2626; }
+    .btn-success { background: #10b981; }
+    .btn-success:hover { background: #059669; }
+
+    /* Permission Badge Status in Lobby */
+    .perm-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 12px; text-align: left; margin-top: 8px; }
+    .perm-item { display: flex; justify-content: space-between; align-items: center; font-size: 13px; margin: 4px 0; }
+    .perm-badge { padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+    .perm-granted { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+    .perm-denied { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+    .perm-prompt { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+
+    /* Chat Header */
+    .chat-header { background: #0f172a; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; }
+    .partner-info { font-size: 14px; font-weight: 600; color: #38bdf8; }
+    .actions { display: flex; gap: 8px; }
+    .icon-btn { background: #334155; color: #fff; border: none; border-radius: 50%; width: 38px; height: 38px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; transition: 0.2s; }
+    .icon-btn:hover { background: #475569; }
+    .call-btn-audio { background: #10b981; }
+    .call-btn-audio:hover { background: #059669; }
+    .call-btn-video { background: #0284c7; }
+    .call-btn-video:hover { background: #0369a1; }
+
+    /* Chat Body */
+    .chat-messages { flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+    .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; font-size: 14px; word-break: break-word; line-height: 1.4; }
+    .msg.me { align-self: flex-end; background: #2563eb; color: #fff; border-bottom-right-radius: 2px; }
+    .msg.peer { align-self: flex-start; background: #334155; color: #fff; border-bottom-left-radius: 2px; }
+    .msg.system { align-self: center; background: rgba(255,255,255,0.06); color: #94a3b8; font-size: 12px; border-radius: 20px; }
+
+    /* Chat Input */
+    .chat-input { padding: 12px; background: #0f172a; display: flex; gap: 8px; border-top: 1px solid #334155; }
+    .chat-input input { flex: 1; }
+
+    /* Waiting Screen */
+    .waiting-spinner { width: 48px; height: 48px; border: 4px solid #334155; border-top-color: #38bdf8; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Call Screen Overlay */
+    .call-overlay { position: absolute; inset: 0; background: rgba(15, 23, 42, 0.96); display: none; flex-direction: column; justify-content: space-between; padding: 20px; text-align: center; z-index: 100; backdrop-filter: blur(8px); }
+    .call-overlay.active { display: flex; }
+    .call-avatar { width: 90px; height: 90px; border-radius: 50%; background: #334155; margin: 15px auto; display: flex; align-items: center; justify-content: center; font-size: 38px; box-shadow: 0 0 20px rgba(56, 189, 248, 0.3); }
+    .pulse { animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.08); } 100% { transform: scale(1); } }
+    
+    /* Video streams container */
+    .video-container { position: relative; width: 100%; height: 320px; background: #000; border-radius: 12px; overflow: hidden; margin: 10px 0; display: none; }
+    .video-container.active { display: block; }
+    #remoteVideo { width: 100%; height: 100%; object-fit: cover; }
+    #localVideo { position: absolute; top: 10px; right: 10px; width: 90px; height: 120px; object-fit: cover; border-radius: 8px; border: 2px solid #38bdf8; z-index: 2; background: #111; }
+
+    .call-controls { display: flex; justify-content: center; align-items: center; gap: 14px; margin-bottom: 10px; }
+
+    /* Permission Modal Alert */
+    .perm-modal { position: absolute; inset: 0; background: rgba(0,0,0,0.85); display: none; justify-content: center; align-items: center; padding: 20px; z-index: 200; }
+    .perm-modal.active { display: flex; }
+    .perm-modal-content { background: #1e293b; border: 1px solid #475569; border-radius: 14px; padding: 20px; text-align: center; max-width: 360px; }
+    .perm-modal-content h3 { color: #f87171; margin-bottom: 10px; font-size: 18px; }
+    .perm-modal-content p { font-size: 13px; color: #cbd5e1; line-height: 1.5; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <!-- 1. LOBBY SCREEN -->
+  <div id="screenLobby" class="screen active lobby">
+    <h1>🔥 Random Chat & Call</h1>
+    <p style="color: #94a3b8; font-size: 13px;">Instant gender-matched partner. Zero saved chats.</p>
+    
+    <div class="form-group">
+      <label>I Am:</label>
+      <select id="myGender">
+        <option value="male">Male ♂</option>
+        <option value="female">Female ♀</option>
+        <option value="other">Other ⚧</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label>Looking For:</label>
+      <select id="targetGender">
+        <option value="female">Female ♀</option>
+        <option value="male">Male ♂</option>
+        <option value="any" selected>Anyone (Fastest) 🌐</option>
+      </select>
+    </div>
+
+    <!-- Media Permissions Status Card -->
+    <div class="perm-card">
+      <div style="font-size: 12px; font-weight: bold; color: #94a3b8; margin-bottom: 6px;">CALL PERMISSIONS:</div>
+      <div class="perm-item">
+        <span>🎤 Microphone (Audio Call)</span>
+        <span id="badgeMic" class="perm-badge perm-prompt">Check</span>
+      </div>
+      <div class="perm-item">
+        <span>📷 Camera (Video Call)</span>
+        <span id="badgeCam" class="perm-badge perm-prompt">Check</span>
+      </div>
+      <button class="btn btn-secondary" style="width: 100%; margin-top: 8px; padding: 6px; font-size: 12px;" onclick="requestAllPermissions()">
+        Grant / Test Permissions
+      </button>
+    </div>
+
+    <button id="btnFindMatch" class="btn" onclick="startSearch()">Start Matching</button>
+  </div>
+
+  <!-- 2. WAITING SCREEN -->
+  <div id="screenWaiting" class="screen lobby">
+    <div class="waiting-spinner"></div>
+    <h2 style="font-size: 18px; color: #38bdf8;">Searching for partner...</h2>
+    <p id="waitingStatus" style="color: #94a3b8; font-size: 13px;">Looking for compatible gender match</p>
+    <button class="btn btn-danger" onclick="cancelSearch()">Cancel</button>
+  </div>
+
+  <!-- 3. CHAT SCREEN (Ephemeral) -->
+  <div id="screenChat" class="screen">
+    <div class="chat-header">
+      <div>
+        <div id="chatPartnerTitle" class="partner-info">Partner</div>
+        <div style="font-size: 11px; color: #10b981;">● Live (Not Saved)</div>
+      </div>
+      <div class="actions">
+        <!-- 📞 Audio Call Button -->
+        <button class="icon-btn call-btn-audio" title="Audio Call" onclick="handleStartCall('audio')">📞</button>
+        <!-- 📹 Video Call Button -->
+        <button class="icon-btn call-btn-video" title="Video Call" onclick="handleStartCall('video')">📹</button>
+        <!-- ⏭ Next / Skip Button -->
+        <button class="icon-btn" title="Next Partner" onclick="nextPartner()">⏭</button>
+      </div>
+    </div>
+
+    <div id="chatMessages" class="chat-messages">
+      <div class="msg system">Matched! Say hello. Chat is ephemeral and never saved.</div>
+    </div>
+
+    <div class="chat-input">
+      <input type="text" id="inputMsg" placeholder="Type a message..." onkeydown="if(event.key==='Enter') sendChatMessage()">
+      <button class="btn" onclick="sendChatMessage()">Send</button>
+    </div>
+  </div>
+
+  <!-- 4. CALL OVERLAY (Incoming / Outgoing / Active Call) -->
+  <div id="callOverlay" class="call-overlay">
+    <div>
+      <div id="callAvatar" class="call-avatar">📞</div>
+      <h2 id="callTitle" style="margin-top: 10px; font-size: 18px;">Calling Partner...</h2>
+      <p id="callSubtitle" style="color: #94a3b8; font-size: 13px; margin-top: 4px;">Ringing...</p>
+    </div>
+
+    <!-- Video Containers for Video Calls -->
+    <div id="videoContainer" class="video-container">
+      <video id="remoteVideo" autoplay playsinline></video>
+      <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+
+    <!-- Audio element for Audio Calls -->
+    <audio id="remoteAudio" autoplay playsinline></audio>
+
+    <div id="callControls" class="call-controls">
+      <!-- Dynamic Buttons injected via JS -->
+    </div>
+  </div>
+
+  <!-- 5. PERMISSION DENIED ERROR MODAL -->
+  <div id="permModal" class="perm-modal">
+    <div class="perm-modal-content">
+      <h3 id="permModalTitle">⚠️ Permission Required</h3>
+      <p id="permModalDesc">Please allow microphone and camera access in your browser to start or receive calls.</p>
+      <button class="btn" style="width: 100%;" onclick="closePermModal()">OK, I will enable it</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const socket = io();
+  let currentMatchId = null;
+  let peerConnection = null;
+  let localStream = null;
+  let currentCallType = 'audio';
+  let isMuted = false;
+
+  const rtcConfig = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' }
+    ]
+  };
+
+  // --- PERMISSION SYSTEM & CHECKS ---
+  async function updatePermissionBadges() {
+    if (navigator.permissions && navigator.permissions.query) {
+      try {
+        const mic = await navigator.permissions.query({ name: 'microphone' });
+        applyBadge('badgeMic', mic.state);
+        mic.onchange = () => applyBadge('badgeMic', mic.state);
+
+        const cam = await navigator.permissions.query({ name: 'camera' });
+        applyBadge('badgeCam', cam.state);
+        cam.onchange = () => applyBadge('badgeCam', cam.state);
+      } catch (e) {
+        // Fallback if browser doesn't support query name 'camera'
+      }
+    }
+  }
+
+  function applyBadge(id, state) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = 'perm-badge ' + (state === 'granted' ? 'perm-granted' : (state === 'denied' ? 'perm-denied' : 'perm-prompt'));
+    el.innerText = state ? state.toUpperCase() : 'UNKNOWN';
+  }
+
+  // Request both Microphone and Camera explicitly
+  async function requestAllPermissions() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      // Stop immediately after granting
+      stream.getTracks().forEach(t => t.stop());
+      applyBadge('badgeMic', 'granted');
+      applyBadge('badgeCam', 'granted');
+      alert('✅ Microphone and Camera permissions granted successfully!');
+    } catch (err) {
+      showPermErrorDialog('Microphone or Camera access was denied: ' + err.message);
+    }
+  }
+
+  // Permission Request Helper for Voice/Video Calls
+  async function acquireMediaStream(callType) {
+    const constraints = {
+      audio: true,
+      video: callType === 'video' ? { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' } : false
+    };
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      return stream;
+    } catch (err) {
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        showPermErrorDialog(
+          `Permission Denied: Your browser blocked access to your ${callType === 'video' ? 'Camera/Microphone' : 'Microphone'}. ` +
+          `Please click the Lock 🔒 icon next to the URL in your browser bar and select "Allow".`
+        );
+      } else if (err.name === 'NotFoundError') {
+        showPermErrorDialog(`No ${callType === 'video' ? 'camera/microphone' : 'microphone'} found on this device.`);
+      } else {
+        showPermErrorDialog(`Media device error: ${err.message}`);
+      }
+      return null;
+    }
+  }
+
+  function showPermErrorDialog(msg) {
+    document.getElementById('permModalDesc').innerText = msg;
+    document.getElementById('permModal').classList.add('active');
+  }
+
+  function closePermModal() {
+    document.getElementById('permModal').classList.remove('active');
+    updatePermissionBadges();
+  }
+
+  // Initialize permission check on load
+  window.addEventListener('DOMContentLoaded', updatePermissionBadges);
+
+  // --- SCREEN NAVIGATION ---
+  function showScreen(screenId) {
+    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+    document.getElementById(screenId).classList.add('active');
+  }
+
+  // --- MATCHMAKING ---
+  function startSearch() {
+    const gender = document.getElementById('myGender').value;
+    const targetGender = document.getElementById('targetGender').value;
+    showScreen('screenWaiting');
+    socket.emit('match:find', { gender, targetGender });
+  }
+
+  function cancelSearch() {
+    socket.emit('match:leave');
+    showScreen('screenLobby');
+  }
+
+  function nextPartner() {
+    endCall();
+    socket.emit('match:leave');
+    document.getElementById('chatMessages').innerHTML = '<div class="msg system">Searching new partner...</div>';
+    startSearch();
+  }
+
+  socket.on('match:waiting', (data) => {
+    document.getElementById('waitingStatus').innerText = data.message;
+  });
+
+  socket.on('match:found', (data) => {
+    currentMatchId = data.matchId;
+    document.getElementById('chatPartnerTitle').innerText = `${data.peer.gender.toUpperCase()} Partner`;
+    document.getElementById('chatMessages').innerHTML = '<div class="msg system">Connected! Messages are never saved to database.</div>';
+    showScreen('screenChat');
+  });
+
+  socket.on('match:peer_left', () => {
+    appendMsg('Partner has left or skipped the chat.', 'system');
+    endCall();
+  });
+
+  // --- EPHEMERAL CHAT ---
+  function sendChatMessage() {
+    const input = document.getElementById('inputMsg');
+    const text = input.value.trim();
+    if (!text || !currentMatchId) return;
+
+    appendMsg(text, 'me');
+    socket.emit('chat:send', { matchId: currentMatchId, message: text });
+    input.value = '';
+  }
+
+  socket.on('chat:receive', (data) => {
+    appendMsg(data.message, 'peer');
+  });
+
+  function appendMsg(text, type) {
+    const box = document.getElementById('chatMessages');
+    const div = document.createElement('div');
+    div.className = `msg ${type}`;
+    div.innerText = text;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  // --- CALLING (AUDIO & VIDEO) ---
+  async function handleStartCall(callType = 'audio') {
+    if (!currentMatchId) return;
+    currentCallType = callType;
+
+    // 1. Check and acquire permissions
+    localStream = await acquireMediaStream(callType);
+    if (!localStream) return; // Permission denied or error occurred
+
+    // Setup local video preview if video call
+    if (callType === 'video') {
+      const localVid = document.getElementById('localVideo');
+      localVid.srcObject = localStream;
+      document.getElementById('videoContainer').classList.add('active');
+    }
+
+    socket.emit('call:initiate', { matchId: currentMatchId, callType });
+    openCallModal('outgoing', `Calling Partner (${callType.toUpperCase()})...`, 'Waiting for partner to answer...');
+  }
+
+  // Incoming Call Handler
+  socket.on('call:incoming', (data) => {
+    currentCallType = data.callType || 'audio';
+    openCallModal('incoming', `Incoming ${currentCallType.toUpperCase()} Call`, `Partner wants to start a ${currentCallType} call!`);
+  });
+
+  socket.on('call:ringing', () => {
+    document.getElementById('callSubtitle').innerText = 'Ringing...';
+  });
+
+  socket.on('call:rejected', () => {
+    alert('Call was declined by partner.');
+    closeCallModal();
+    cleanupMedia();
+  });
+
+  socket.on('call:accepted', async () => {
+    setupWebRTC();
+    const offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
+    socket.emit('webrtc:offer', { matchId: currentMatchId, sdp: offer });
+    document.getElementById('callSubtitle').innerText = 'Connected (Call Active)';
+    showActiveControls();
+  });
+
+  socket.on('call:connected', () => {
+    document.getElementById('callSubtitle').innerText = 'Connected (Call Active)';
+    showActiveControls();
+  });
+
+  socket.on('call:ended', () => {
+    endCall();
+  });
+
+  // Accept Call with Permission Verification
+  async function acceptCall() {
+    localStream = await acquireMediaStream(currentCallType);
+    if (!localStream) return;
+
+    if (currentCallType === 'video') {
+      document.getElementById('localVideo').srcObject = localStream;
+      document.getElementById('videoContainer').classList.add('active');
+    }
+
+    setupWebRTC();
+    socket.emit('call:accept', { matchId: currentMatchId });
+    openCallModal('active', `Live ${currentCallType.toUpperCase()} Call`, 'Connected');
+    showActiveControls();
+  }
+
+  function declineCall() {
+    socket.emit('call:reject', { matchId: currentMatchId });
+    closeCallModal();
+    cleanupMedia();
+  }
+
+  function endCall() {
+    if (currentMatchId) socket.emit('call:end', { matchId: currentMatchId });
+    cleanupMedia();
+    closeCallModal();
+  }
+
+  function toggleMute() {
+    if (localStream) {
+      const audioTrack = localStream.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled;
+        isMuted = !audioTrack.enabled;
+        document.getElementById('btnMute').innerText = isMuted ? 'Unmute 🔇' : 'Mute 🎤';
+      }
+    }
+  }
+
+  function cleanupMedia() {
+    if (peerConnection) {
+      peerConnection.close();
+      peerConnection = null;
+    }
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+      localStream = null;
+    }
+    document.getElementById('localVideo').srcObject = null;
+    document.getElementById('remoteVideo').srcObject = null;
+    document.getElementById('remoteAudio').srcObject = null;
+    document.getElementById('videoContainer').classList.remove('active');
+  }
+
+  // --- WEBRTC SETUP ---
+  function setupWebRTC() {
+    peerConnection = new RTCPeerConnection(rtcConfig);
+
+    if (localStream) {
+      localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+    }
+
+    peerConnection.ontrack = (event) => {
+      if (currentCallType === 'video') {
+        document.getElementById('remoteVideo').srcObject = event.streams[0];
+        document.getElementById('videoContainer').classList.add('active');
+      } else {
+        document.getElementById('remoteAudio').srcObject = event.streams[0];
+      }
+    };
+
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit('webrtc:ice-candidate', { matchId: currentMatchId, candidate: event.candidate });
+      }
+    };
+  }
+
+  socket.on('webrtc:offer', async ({ sdp }) => {
+    if (!peerConnection) setupWebRTC();
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
+    socket.emit('webrtc:answer', { matchId: currentMatchId, sdp: answer });
+  });
+
+  socket.on('webrtc:answer', async ({ sdp }) => {
+    if (peerConnection) {
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+    }
+  });
+
+  socket.on('webrtc:ice-candidate', async ({ candidate }) => {
+    if (peerConnection && candidate) {
+      await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+    }
+  });
+
+  // --- UI MODAL HELPERS ---
+  function openCallModal(mode, title, subtitle) {
+    const overlay = document.getElementById('callOverlay');
+    const avatar = document.getElementById('callAvatar');
+    const controls = document.getElementById('callControls');
+    document.getElementById('callTitle').innerText = title;
+    document.getElementById('callSubtitle').innerText = subtitle;
+    overlay.classList.add('active');
+
+    if (mode === 'incoming') {
+      avatar.classList.add('pulse');
+      avatar.innerText = currentCallType === 'video' ? '📹' : '📞';
+      controls.innerHTML = `
+        <button class="btn btn-success" onclick="acceptCall()">Accept (${currentCallType}) 📞</button>
+        <button class="btn btn-danger" onclick="declineCall()">Decline ✕</button>
+      `;
+    } else {
+      avatar.classList.remove('pulse');
+      avatar.innerText = currentCallType === 'video' ? '📹' : '📞';
+      controls.innerHTML = `
+        <button class="btn btn-danger" onclick="endCall()">Cancel Call 📵</button>
+      `;
+    }
+  }
+
+  function showActiveControls() {
+    const controls = document.getElementById('callControls');
+    controls.innerHTML = `
+      <button id="btnMute" class="btn btn-secondary" onclick="toggleMute()">Mute 🎤</button>
+      <button class="btn btn-danger" onclick="endCall()">End Call 📵</button>
+    `;
+  }
+
+  function closeCallModal() {
+    document.getElementById('callOverlay').classList.remove('active');
+  }
+</script>
+</body>
+</html>
